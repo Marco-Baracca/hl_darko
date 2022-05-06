@@ -11,6 +11,8 @@
 #include <ros/ros.h>
 #include <geometry_msgs/Pose.h>
 
+#include <std_msgs/Float64.h>
+
 const static Eigen::IOFormat CSVFormat(Eigen::StreamPrecision, Eigen::DontAlignCols, ", ", "\n");
 
 
@@ -27,15 +29,21 @@ Eigen::Matrix3d pre_rot;
 
 Eigen::MatrixXd ee_trajectory(6, NUM_COLS);
 
+double safe_velocity = 1000;
+Eigen::RowVectorXd max_norm_velocity(NUM_COLS-1);
+Eigen::RowVectorXd max_norm_velocity_backward(NUM_COLS-1);
+
 Eigen::VectorXd initial_EE_point(6);
+Eigen::VectorXd final_EE_point(6);
 bool initial_pose_init = false;
+bool desired_pose_init = false;
 geometry_msgs::Pose msg_pose;
 
 void load_fpc()
 {
     if (!file_stream.is_open())
     {
-        std::cout << "ERRORE APERTURA .csv\n";
+        std::cout << "ERROR OPENING .csv\n";
     }
 
     data_matrix.resize(NUM_ROWS, NUM_COLS);
@@ -97,7 +105,7 @@ void single_dof(double starting_point, double ending_point, double starting_vel,
     ee_trajectory.block(i,0,1,NUM_COLS) = trajectory_single_dof;
 }
 
-// Convert xyzrpy vector to geometry_msgs Pose (PRESA DA PANDA-SOFTHAND -> TaskSequencer.cpp)
+// Convert xyzrpy vector to geometry_msgs Pose
 geometry_msgs::Pose convert_vector_to_pose(Eigen::VectorXd input_vec){
     
     // Creating temporary variables
@@ -114,13 +122,41 @@ geometry_msgs::Pose convert_vector_to_pose(Eigen::VectorXd input_vec){
     output_affine.linear() = rotation;    
     
     // Converting to geometry_msgs and returning
-    tf::poseEigenToMsg(output_affine, output_pose);  //CONTROLLARE SE METTERE #include <eigen_conversions/eigen_msg.h>
+    tf::poseEigenToMsg(output_affine, output_pose);
     return output_pose;
 }
 
 void robotPoseCallback(const geometry_msgs::PoseStamped& msg)
 {
     if (!initial_pose_init)
+    {
+        msg_pose = msg.pose;
+        std::cout << "Message received" << std::endl;
+        //std::cout << msg << std::endl;
+        Eigen::Affine3d input_affine;
+        Eigen::Vector3d traslazione;
+        Eigen::Vector3d rpy;
+        Eigen::Matrix3d mat_rotazione;
+        tf::poseMsgToEigen(msg_pose,input_affine);
+        traslazione = input_affine.translation();
+        mat_rotazione = input_affine.rotation();
+        mat_rotazione = pre_rot*mat_rotazione;
+        rpy = mat_rotazione.eulerAngles(2, 1, 0);
+
+        
+        initial_EE_point << traslazione[0], traslazione[1], traslazione[2], rpy[2], rpy[1], rpy[0];
+        // CHECK ON THE FINAL POSE LISTENING
+        //std::cout << "Starting pose read from topic:" << std::endl;
+        //std::cout << initial_EE_point << std::endl;
+
+        initial_pose_init = true;
+    }
+    
+}
+
+void desiredPoseCallback(const geometry_msgs::PoseStamped& msg)
+{
+    if (!desired_pose_init)
     {
         msg_pose = msg.pose;
         std::cout << "Message received" << std::endl;
@@ -136,19 +172,59 @@ void robotPoseCallback(const geometry_msgs::PoseStamped& msg)
         rpy = mat_rotazione.eulerAngles(2, 1, 0);
 
         
-        initial_EE_point << traslazione[0], traslazione[1], traslazione[2], rpy[2], rpy[1], rpy[0];
-        std::cout << "Starting pose read from topic:" << std::endl;
-        std::cout << initial_EE_point << std::endl;
+        final_EE_point << traslazione[0], traslazione[1], traslazione[2], rpy[2], rpy[1], rpy[0];
+        // CHECK ON THE FINAL POSE LISTENING
+        //std::cout << "Desired pose read from topic:" << std::endl;
+        //std::cout << final_EE_point << std::endl;
 
-        initial_pose_init = true;
+        desired_pose_init = true;
     }
     
+}
+
+void safeVelocityCallback(const std_msgs::Float64& msg)
+{
+    safe_velocity = msg.data;
+}
+
+void trajectory_maximum_velocity()
+{
+    Eigen::RowVectorXd norm_velocity(NUM_COLS-1);
+
+    for (int i = 0; i < NUM_COLS-1 ; i++)
+    {
+        Eigen::Vector3d aux = ee_trajectory.block(0, i+1, 3, 1) - ee_trajectory.block(0, i, 3, 1);
+        norm_velocity[i] = aux.norm();
+    }
+    double max_aux = 0;
+    double max_aux_bkw = 0;
+    for (int i = NUM_COLS-2; i >= 0; i--)
+    {
+        if (max_aux > norm_velocity[i])
+        {
+            max_norm_velocity[i] = max_aux;
+        }else{
+            max_norm_velocity[i] = norm_velocity[i];
+            max_aux = norm_velocity[i];
+        } 
+    }
+    for (int i = 0; i < NUM_COLS -1; i++)
+    {
+        if (max_aux_bkw > norm_velocity[i])
+        {
+            max_norm_velocity_backward[i] = max_aux;
+        }else{
+            max_norm_velocity_backward[i] = norm_velocity[i];
+            max_aux = norm_velocity[i];
+        } 
+    }
 }
 
 
 int main(int argc, char **argv)
 {
-    pre_rot << 1, 0, 0, 0, -1, 0, 0, 0, -1;
+    pre_rot << 1, 0, 0, 0, 1, 0, 0, 0, 1;
+    //pre_rot << 1, 0, 0, 0, -1, 0, 0, 0, -1;
     //Initialize the node
     ROS_INFO("NODE INITIALIZATION");
     ros::init(argc, argv, "HL_planner");
@@ -156,10 +232,16 @@ int main(int argc, char **argv)
 
     //Initialize frame trajectory publisher
     ROS_INFO("PUBLISHER INITIALIZATION");
-    ros::Publisher pub = node.advertise<geometry_msgs::PoseStamped>("/franka/equilibrium_pose", 1); //DA SISTEMARE SIA PER IL NOME CHE PER IL TIPO DI MSG
+    ros::Publisher pub = node.advertise<geometry_msgs::PoseStamped>("/manipulation/equilibrium_pose", 1);
 
     //Initialize starting pose subscriber
-    ros::Subscriber robot_pose_sub = node.subscribe("/franka_ee_pose", 1, robotPoseCallback);
+    ros::Subscriber robot_pose_sub = node.subscribe("/manipulation/franka_ee_pose", 1, robotPoseCallback);
+
+    //Initialize desired pose subscriber
+    ros::Subscriber desired_pose_sub = node.subscribe("/manipulation/desired_ee_pose", 1, desiredPoseCallback);
+
+    //Initialize maximum velocity
+    ros::Subscriber safe_velocity_sub = node.subscribe("/manipulation/safe_velocity", 1, safeVelocityCallback);
     
     //Load the fPCs
     ROS_INFO("LOAD fPCs");
@@ -169,6 +251,7 @@ int main(int argc, char **argv)
     //Starting and ending times definition
     double t_start = 0;
     double t_end;
+    //double t_end = 5;
 
     std::cout << "Input time to perform trajectory [s]";
     std::cin >> t_end;
@@ -181,82 +264,108 @@ int main(int argc, char **argv)
     Eigen::VectorXd initial_velocity(6);
     Eigen::VectorXd final_velocity(6);
 
-    initial_velocity << 0, 0, 0, 0, 0, 0; //POI DA SOSTITUIRE CON QUELLA ALL'ISTANTE INIZIALE DEL ROBOT
-    
-    double aux;
-    //std::cout << "Input final velocity vector element by element (xyzrpy)";
-    //for (int i = 0; i < 6; i++)
-    //{
-    //    std::cin >> aux;
-    //    final_velocity(i) = aux;
-    //}
+    initial_velocity << 0, 0, 0, 0, 0, 0;
     
     final_velocity << 0, 0, 0, 0, 0, 0;
 
-    //Cartesian constrains definition
 
-    Eigen::VectorXd final_EE_point(6);
-
-    std::cout << "Input final pose vector element by element (xyzrpy)";
-    
-    for (int i = 0; i < 6; i++)
-    {
-        std::cin >> aux;
-        final_EE_point(i) = aux;
-    }
-
-    ROS_INFO("INPUT COMPLETED");
-
-
+    //Sampling time definition
+    double dt_min;
     double dt;
-    dt = t(2)-t(1);
+    double dt_orig = t(2)-t(1);
+    dt = dt_orig;
 
     while (ros::ok())
     {
         ros::spinOnce();
         if (initial_pose_init)
         {
+            if (desired_pose_init)
+            {
             ROS_INFO("Trajectory Computation");
             //Trajectory computation
-            for (int i = 0; i < 6; i++)
-            {
-                single_dof(initial_EE_point(i), final_EE_point(i), initial_velocity(i), final_velocity(i), i, dt);
-            }
-            
-            Eigen::VectorXd actual_pose;
-            geometry_msgs::Pose actual_pose_msg;
-            geometry_msgs::PoseStamped actual_posestamped_msg;
-
-            ros::Rate rate(1/dt);
-
-            ROS_INFO("Trajectory Publishing");
-            for (int i = 0; i < NUM_COLS; i++)
-            {
-                actual_pose = ee_trajectory.col(i);
-                actual_pose_msg = convert_vector_to_pose(actual_pose);
-                actual_posestamped_msg.pose = actual_pose_msg;
-                if (i==0)
+                for (int i = 0; i < 6; i++)
                 {
-                    std::cout << "First Frame" << std::endl;
-                    std::cout << actual_pose_msg << std::endl;
+                    single_dof(initial_EE_point(i), final_EE_point(i), initial_velocity(i), final_velocity(i), i, dt);
                 }
-                actual_posestamped_msg.header.stamp = ros::Time::now();
-                pub.publish(actual_posestamped_msg);
-                rate.sleep();
-            }
 
-            break;
+                trajectory_maximum_velocity();                
+                
+                Eigen::VectorXd actual_pose;
+                geometry_msgs::Pose actual_pose_msg;
+                geometry_msgs::PoseStamped actual_posestamped_msg;
+
+                ros::Rate rate(1/dt);
+
+                ROS_INFO("Trajectory Publishing");
+                // Reaching the target
+                for (int i = 0; i < NUM_COLS; i++)
+                {
+                    actual_pose = ee_trajectory.col(i);
+                    actual_pose_msg = convert_vector_to_pose(actual_pose);
+                    actual_posestamped_msg.pose = actual_pose_msg;
+                    // CHECK ON THE INITIAL POSE LISTENING
+                    //if (i==0)
+                    //{
+                    //    std::cout << "First Frame" << std::endl;
+                    //    std::cout << actual_pose_msg << std::endl;
+                    //}
+                    actual_posestamped_msg.header.stamp = ros::Time::now();
+                    pub.publish(actual_posestamped_msg);
+                    if (i < (NUM_COLS-1))
+                    {
+                        //std::cout << i << std::endl;
+                        dt_min = max_norm_velocity[i]/safe_velocity;
+                        if (dt < dt_min)
+                        {
+                            //ROS_INFO("CAMBIO dt");
+                            dt = dt_min;
+                            rate = ros::Rate (1/dt);
+                        }
+                    }
+
+                    rate.sleep();
+                }
+
+                //PUT A COMMAND TO CLOSE THE GRIPPER
+
+                //Come back to the initial position
+
+                dt = dt_orig;
+                rate = ros::Rate(1/dt);
+
+                for (int i = NUM_COLS-1; i > 0; i--)
+                {
+                    actual_pose = ee_trajectory.col(i);
+                    actual_pose_msg = convert_vector_to_pose(actual_pose);
+                    actual_posestamped_msg.pose = actual_pose_msg;
+                    actual_posestamped_msg.header.stamp = ros::Time::now();
+                    pub.publish(actual_posestamped_msg);
+                    if (i < (NUM_COLS-1)) //to be corrected for backward trajectory
+                    {
+                        //std::cout << i << std::endl;
+                        dt_min = max_norm_velocity[i]/safe_velocity;
+                        if (dt < dt_min)
+                        {
+                            ROS_INFO("CAMBIO dt");
+                            dt = dt_min;
+                            rate = ros::Rate(1/dt);
+                        }
+                    }
+
+                    rate.sleep();
+                }
+
+                break;
+            }
+            ROS_INFO("WAITING DESIRED POSE");
         }
-        ROS_INFO("WAITING INITIAL POSE");
-        
+        if (!desired_pose_init)
+        {
+            ROS_INFO("WAITING INITIAL POSE");
+        }   
     }
     
     ROS_INFO("TASK COMPLETED");
-
-    std::ofstream myfile_1;
-    myfile_1.open("/home/mb/catkin_ws/src/hl_planning/src/traiettoria_calcolata.csv");
-    myfile_1 << ee_trajectory.format(CSVFormat);
-    myfile_1.close();
-
 
 }

@@ -144,6 +144,7 @@ include_directories(
 ## The recommended prefix ensures that target names across packages don't collide
 # add_executable(${PROJECT_NAME}_node src/hl_planning_node.cpp)
 add_executable(hl_darko src/hl_darko.cpp)
+add_executable(hl_example src/hl_example.cpp)
 
 ## Rename C++ executable without prefix
 ## The above recommended prefix causes long target names, the following renames the
@@ -162,6 +163,7 @@ add_executable(hl_darko src/hl_darko.cpp)
 target_link_libraries(hl_darko
     ${catkin_LIBRARIES}
 )
+target_link_libraries(hl_example ${catkin_LIBRARIES})
 
 #############
 ## Install ##
